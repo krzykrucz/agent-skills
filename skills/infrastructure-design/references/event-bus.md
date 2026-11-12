@@ -41,6 +41,42 @@ export class InMemoryEventBus implements EventBus {
 }
 ```
 
+```kotlin
+interface DomainError
+
+interface DomainEvent {
+    val eventId: UUID
+    val occurredOn: Instant
+}
+
+interface DomainEventSubscriber<T : DomainEvent> {
+    fun subscribedTo(): List<KClass<out T>>
+    suspend fun on(event: T): Either<DomainError, Unit>
+}
+
+typealias EventHandler = suspend (DomainEvent) -> Either<DomainError, Unit>
+
+class InMemoryEventBus(subscribers: List<DomainEventSubscriber<*>>) {
+    private val subscriptions: Map<KClass<out DomainEvent>, List<EventHandler>> =
+        subscribers.flatMap { it.handlers() }.groupBy({ it.first }, { it.second })
+
+    suspend fun publish(events: List<DomainEvent>): Either<DomainError, Unit> = either {
+        for (event in events) {
+            // Sequential dispatch avoids sibling work outliving a failed publication; the first Left stops it.
+            for (handler in subscriptions[event::class].orEmpty()) {
+                handler(event).bind()
+            }
+        }
+    }
+}
+
+private fun <T : DomainEvent> DomainEventSubscriber<T>.handlers(): List<Pair<KClass<out T>, EventHandler>> =
+    subscribedTo().map { eventType ->
+        val handler: EventHandler = { event -> on(eventType.java.cast(event)) }
+        eventType to handler
+    }
+```
+
 Choose and document one failure policy:
 
 - **Fail-fast/propagate:** publication rejects if a synchronous handler fails.
@@ -61,6 +97,57 @@ await transactionManager.run(async (tx) => {
 });
 user.clearDomainEvents(pending); // only after commit succeeds
 ```
+
+```kotlin
+data class InfrastructureError(val reason: String, val cause: Throwable? = null) : DomainError
+
+interface PostRepository {
+    suspend fun save(post: Post, tx: DSLContext): Either<InfrastructureError, Unit>
+}
+
+data class IntegrationMessage(val id: UUID, val name: String, val occurredOn: Instant, val payload: String)
+
+interface IntegrationMessageOutbox {
+    suspend fun append(messages: List<IntegrationMessage>, tx: DSLContext): Either<InfrastructureError, Unit>
+}
+
+suspend fun saveWithOutbox(
+    result: PostResult,
+    repository: PostRepository,
+    outbox: IntegrationMessageOutbox,
+    transactions: JooqTransactions,
+): Either<DomainError, Unit> =
+    transactions.run { tx ->
+        either {
+            repository.save(result.post, tx).bind()
+            outbox.append(toIntegrationMessages(result.events), tx).bind()
+        }
+    }
+
+fun toIntegrationMessages(events: List<PostDomainEvent>): List<IntegrationMessage> =
+    events.map { event ->
+        when (event) {
+            is PostPublished -> IntegrationMessage(
+                event.eventId, "post.published", event.occurredOn,
+                jsonObject("postId" to event.postId.value, "userId" to event.userId, "content" to event.content),
+            )
+            is PostLikeAdded -> IntegrationMessage(
+                event.eventId, "post.like_added", event.occurredOn,
+                jsonObject("postId" to event.postId.value),
+            )
+        }
+    }
+
+// Use your JSON library here; this keeps the example dependency-free.
+private fun jsonObject(vararg fields: Pair<String, String>): String =
+    fields.joinToString(",", "{", "}") { (key, value) -> "${jsonString(key)}:${jsonString(value)}" }
+
+private fun jsonString(value: String): String =
+    value.map { c -> if (c == '"' || c == '\\' || c < ' ') "\\u%04x".format(c.code) else "$c" }
+        .joinToString("", "\"", "\"")
+```
+
+In Kotlin the events come back with the new state (`PostResult`), so there is no snapshot or clear step.
 
 An Event Bus that opens a separate transaction around only its inserts does not solve the dual-write problem. An external broker cannot participate atomically in a normal database transaction; retain the Outbox even when the relay publishes to RabbitMQ or Kafka.
 

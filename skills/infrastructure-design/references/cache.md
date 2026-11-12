@@ -50,6 +50,61 @@ async search(id: PostId): Promise<Post | null> {
 }
 ```
 
+```kotlin
+interface Cache {
+    suspend fun get(key: String): String?
+    suspend fun set(key: String, value: String, ttl: Duration)
+    suspend fun delete(key: String)
+}
+
+interface CacheMetrics {
+    fun cacheReadFailed(e: Throwable)
+    fun cachePayloadInvalid(key: String)
+    fun cacheWriteFailed(e: Throwable)
+}
+
+interface PostSource {
+    suspend fun search(id: PostId): Either<InfrastructureError, Post?>
+}
+
+class CachedPostSource(
+    private val cache: Cache,
+    private val source: PostSource,
+    private val metrics: CacheMetrics,
+) : PostSource {
+
+    override suspend fun search(id: PostId): Either<InfrastructureError, Post?> {
+        val key = postKey(id)
+        return readCached(key)?.right()
+            ?: source.search(id).onRight { post -> if (post != null) writeCached(key, post) }
+    }
+
+    private suspend fun readCached(key: String): Post? {
+        val raw = Either.catch { cache.get(key) }.onLeft(metrics::cacheReadFailed).getOrNull() ?: return null
+        return decodePost(raw) ?: run {
+            metrics.cachePayloadInvalid(key)
+            Either.catch { cache.delete(key) }
+            null
+        }
+    }
+
+    private suspend fun writeCached(key: String, post: Post) {
+        Either.catch { cache.set(key, encodePost(post), ttlWithJitter(60)) }.onLeft(metrics::cacheWriteFailed)
+    }
+}
+
+fun postKey(id: PostId): String = "posts:post:v1:${id.value}"
+
+fun encodePost(post: Post): String = listOf("v1", post.id.value, post.userId, post.content).joinToString("\t")
+
+fun decodePost(raw: String): Post? {
+    val (version, id, userId, content) = raw.split("\t", limit = 4).takeIf { it.size == 4 } ?: return null
+    return if (version == "v1") Post(PostId(id), userId, content) else null
+}
+
+fun ttlWithJitter(seconds: Long): Duration = (seconds + Random.nextLong(seconds / 10 + 1)).seconds
+```
+
 For ordinary performance caches, reads should usually fail open to the authoritative source with short timeouts and a circuit breaker. Security decisions, authorization, idempotency, locks, and correctness-critical state are not ordinary caches; do not silently fail open there.
 
 Negative caching can protect the source from repeated misses, but use a distinguishable sentinel, short TTL, and invalidation on create. Never confuse cached absence, corrupted data, and Redis failure.

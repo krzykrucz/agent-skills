@@ -244,6 +244,74 @@ export class MariaDBPostProjectionRepository implements PostProjectionRepository
 }
 ```
 
+```kotlin
+data class PostProjection(
+    val id: PostId,
+    val userId: String,
+    val content: String,
+    val totalLikes: Long,
+    val createdAt: Instant,
+) {
+    fun incrementLikes(): PostProjection = copy(totalLikes = totalLikes + 1)
+}
+
+interface PostProjectionRepository {
+    suspend fun search(id: PostId): Either<InfrastructureError, PostProjection?>
+    suspend fun save(projection: PostProjection): Either<InfrastructureError, Unit>
+}
+
+class OnPostLikeAddedUpdatePostProjection(
+    private val repository: PostProjectionRepository,
+) : DomainEventSubscriber<PostLikeAdded> {
+
+    override fun subscribedTo(): List<KClass<out PostLikeAdded>> = listOf(PostLikeAdded::class)
+
+    override suspend fun on(event: PostLikeAdded): Either<DomainError, Unit> = either {
+        val projection = repository.search(event.postId).bind() ?: return@either
+        repository.save(projection.incrementLikes()).bind()
+    }
+}
+
+// Writes to the denormalized projection table
+class JooqPostProjectionRepository(private val dsl: DSLContext) : PostProjectionRepository {
+
+    override suspend fun search(id: PostId): Either<InfrastructureError, PostProjection?> =
+        Either.catch {
+            dsl.select(ID, USER_ID, CONTENT, TOTAL_LIKES, CREATED_AT)
+                .from(POSTS_PROJECTION)
+                .where(ID.eq(id.value))
+                .awaitFirstOrNull()
+                ?.let { row ->
+                    PostProjection(PostId(row[ID]), row[USER_ID], row[CONTENT], row[TOTAL_LIKES], row[CREATED_AT])
+                }
+        }.mapLeft { InfrastructureError("posts_projection search failed", it) }
+
+    override suspend fun save(projection: PostProjection): Either<InfrastructureError, Unit> =
+        Either.catch {
+            dsl.insertInto(POSTS_PROJECTION)
+                .set(ID, projection.id.value)
+                .set(USER_ID, projection.userId)
+                .set(CONTENT, projection.content)
+                .set(TOTAL_LIKES, projection.totalLikes)
+                .set(CREATED_AT, projection.createdAt)
+                .onConflict(ID)
+                .doUpdate()
+                .set(TOTAL_LIKES, projection.totalLikes)
+                .awaitSingle()
+            Unit
+        }.mapLeft { InfrastructureError("posts_projection save failed", it) }
+
+    private companion object {
+        val POSTS_PROJECTION = DSL.table("posts_projection")
+        val ID = DSL.field("id", SQLDataType.VARCHAR)
+        val USER_ID = DSL.field("user_id", SQLDataType.VARCHAR)
+        val CONTENT = DSL.field("content", SQLDataType.CLOB)
+        val TOTAL_LIKES = DSL.field("total_likes", SQLDataType.BIGINT)
+        val CREATED_AT = DSL.field("created_at", SQLDataType.INSTANT)
+    }
+}
+```
+
 ---
 
 ## Views vs Projections vs Cache: Decision Table

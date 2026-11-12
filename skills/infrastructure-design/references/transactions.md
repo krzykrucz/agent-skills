@@ -67,6 +67,83 @@ export class InlineTransactionalPostPublisher {
 }
 ```
 
+```kotlin
+@JvmInline
+value class PostId(val value: String)
+
+data class Post(val id: PostId, val userId: String, val content: String) {
+    companion object {
+        fun publish(id: PostId, userId: String, content: String, eventId: UUID, now: Instant): PostResult =
+            PostResult(
+                post = Post(id, userId, content),
+                events = listOf(PostPublished(eventId, now, id, userId, content)),
+            )
+    }
+}
+
+sealed interface PostDomainEvent : DomainEvent
+
+data class PostPublished(
+    override val eventId: UUID,
+    override val occurredOn: Instant,
+    val postId: PostId,
+    val userId: String,
+    val content: String,
+) : PostDomainEvent
+
+data class PostLikeAdded(
+    override val eventId: UUID,
+    override val occurredOn: Instant,
+    val postId: PostId,
+) : PostDomainEvent
+
+data class PostResult(val post: Post, val events: List<PostDomainEvent>)
+
+class JooqTransactions(private val dsl: DSLContext) {
+
+    // A Left rolls back: it leaves the jOOQ transaction as an exception and comes back out as the same Left.
+    suspend fun <T> run(block: suspend (tx: DSLContext) -> Either<DomainError, T>): Either<DomainError, T> =
+        Either.catch {
+            dsl.transactionCoroutine { configuration ->
+                val tx = configuration.dsl()
+                withContext(TransactionElement(tx)) { block(tx) }.getOrElse { throw Rollback(it) }
+            }
+        }.mapLeft { e ->
+            when (e) {
+                is Rollback -> e.error
+                else -> InfrastructureError("transaction failed", e)
+            }
+        }
+
+    private class Rollback(val error: DomainError) : RuntimeException(null, null, false, false)
+}
+
+interface PostPublisher {
+    suspend fun publish(id: PostId, userId: String, content: String): Either<DomainError, Unit>
+}
+
+class InlineTransactionalPostPublisher(
+    private val clock: Clock,
+    private val generateId: () -> UUID,
+    private val repository: PostRepository,
+    private val outbox: IntegrationMessageOutbox,
+    private val transactions: JooqTransactions,
+) : PostPublisher {
+
+    override suspend fun publish(id: PostId, userId: String, content: String): Either<DomainError, Unit> {
+        val result = Post.publish(id, userId, content, generateId(), clock.instant())
+        return transactions.run { tx ->
+            either {
+                repository.save(result.post, tx).bind()
+                outbox.append(toIntegrationMessages(result.events), tx).bind()
+            }
+        }
+    }
+}
+```
+
+In Kotlin the events come back with the new state (`PostResult`), so there is no snapshot or clear step.
+
 The Unit of Work must not permanently discard pulled events when the transaction rolls back. Append them durably before commit and retain/recover pending events on failure, or inspect pending events without draining until the handoff succeeds. See `event-bus.md` for the full Outbox contract.
 
 ---
@@ -103,6 +180,25 @@ export class TransactionalPostPublisher implements PostPublisherInterface {
     });
   }
 }
+```
+
+```kotlin
+// Adapters behind the wrapped publisher call currentDsl(dsl) instead of taking tx.
+class TransactionalPostPublisher(
+    private val wrapped: PostPublisher,
+    private val transactions: JooqTransactions,
+) : PostPublisher {
+
+    override suspend fun publish(id: PostId, userId: String, content: String): Either<DomainError, Unit> =
+        transactions.run { _ -> wrapped.publish(id, userId, content) }
+}
+
+class TransactionElement(val tx: DSLContext) : AbstractCoroutineContextElement(Key) {
+    companion object Key : CoroutineContext.Key<TransactionElement>
+}
+
+suspend fun currentDsl(default: DSLContext): DSLContext =
+    currentCoroutineContext()[TransactionElement]?.tx ?: default
 ```
 
 ---
