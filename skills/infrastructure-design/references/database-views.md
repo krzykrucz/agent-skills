@@ -244,6 +244,40 @@ export class MariaDBPostProjectionRepository implements PostProjectionRepository
 }
 ```
 
+**Example — Kotlin event handler updating a projection:**
+```kotlin
+// OnPostLikeAddedUpdatePostProjection.kt
+class OnPostLikeAddedUpdatePostProjection(
+    private val projectionRepository: PostProjectionRepository,
+) : DomainEventSubscriber<PostLikeAdded> {
+
+    override fun subscribedTo(): List<KClass<out PostLikeAdded>> = listOf(PostLikeAdded::class)
+
+    override suspend fun on(domainEvent: PostLikeAdded): Either<DomainError, Unit> = either {
+        val projection = projectionRepository.search(domainEvent.postId).bind() ?: return@either
+        projectionRepository.save(projection.incrementLikes()).bind()
+    }
+}
+
+// JooqPostProjectionRepository.kt — writes to the denormalized projection table
+class JooqPostProjectionRepository(private val db: DSLContext) : PostProjectionRepository {
+    override suspend fun save(projection: PostProjection): Either<InfrastructureError, Unit> =
+        Either.catch {
+            db.insertInto(POSTS_PROJECTION)
+                .set(POSTS_PROJECTION.ID, projection.id.value)
+                .set(POSTS_PROJECTION.USER_ID, projection.userId.value)
+                .set(POSTS_PROJECTION.CONTENT, projection.content.value)
+                .set(POSTS_PROJECTION.TOTAL_LIKES, projection.totalLikes)
+                .set(POSTS_PROJECTION.CREATED_AT, projection.createdAt)
+                .onConflict(POSTS_PROJECTION.ID)
+                .doUpdate()
+                .set(POSTS_PROJECTION.TOTAL_LIKES, projection.totalLikes)
+                .awaitFirst()
+            Unit
+        }.mapLeft { InfrastructureError("Failed saving post projection ${projection.id}", it) }
+}
+```
+
 ---
 
 ## Views vs Projections vs Cache: Decision Table

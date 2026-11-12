@@ -67,6 +67,47 @@ export class InlineTransactionalPostPublisher {
 }
 ```
 
+```kotlin
+// InlineTransactionalPostPublisher.kt — explicit inline strategy
+class InlineTransactionalPostPublisher(
+    private val clock: Clock,
+    private val repository: PostRepository,
+    private val outbox: IntegrationMessageOutbox,
+    private val transactionManager: TransactionManager,
+    private val generateUUID: () -> UUID,
+) : PostPublisher {
+    override suspend fun publish(id: PostId, userId: UserId, content: PostContent): Either<DomainError, Unit> {
+        val (post, events) = Post.publish(id, userId, content, generateUUID(), clock.instant())
+        return transactionManager.run { tx ->
+            either {
+                repository.save(post, tx).bind()
+                outbox.append(events.map(::toIntegrationMessage), tx).bind()
+            }
+        }
+    }
+}
+
+// JooqTransactionManager.kt — a Left must leave the jOOQ block as an exception to roll back
+class JooqTransactionManager(private val db: DSLContext) : TransactionManager {
+    override suspend fun <A> run(block: suspend (Transaction) -> Either<DomainError, A>): Either<DomainError, A> =
+        try {
+            db.transactionCoroutine { configuration ->
+                block(JooqTransaction(configuration.dsl())).getOrElse { throw Rollback(it) }
+            }.right()
+        } catch (e: Rollback) {
+            e.error.left()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            InfrastructureError("Transaction failed", e).left()
+        }
+
+    private class Rollback(val error: DomainError) : RuntimeException(null, null, false, false)
+}
+```
+
+In Kotlin, `Post.publish` is a pure function that returns the new state together with its events (see `ddd-best-practices`), so there is no pending list to drain or clear. `TransactionManager.run` commits only on `Right`. jOOQ commits when the block returns normally, so a `Left` returned from `transactionCoroutine` or `transactionResult` commits the writes made before it; the adapter must convert it into an exception and back. Rethrow `CancellationException` so a cancelled coroutine is not reported as an infrastructure failure. `Transaction` is an opaque application type; only jOOQ adapters unwrap the transaction-scoped `DSLContext` from `JooqTransaction`.
+
 The Unit of Work must not permanently discard pulled events when the transaction rolls back. Append them durably before commit and retain/recover pending events on failure, or inspect pending events without draining until the handoff succeeds. See `event-bus.md` for the full Outbox contract.
 
 ---
@@ -104,6 +145,19 @@ export class TransactionalPostPublisher implements PostPublisherInterface {
   }
 }
 ```
+
+```kotlin
+// TransactionalPostPublisher.kt — decorator approach
+class TransactionalPostPublisher(
+    private val wrapped: PostPublisher,
+    private val transactionManager: TransactionManager,
+) : PostPublisher {
+    override suspend fun publish(id: PostId, userId: UserId, content: PostContent): Either<DomainError, Unit> =
+        transactionManager.run { wrapped.publish(id, userId, content) }
+}
+```
+
+The wrapped use case never receives `tx`, so in Kotlin its repositories must find the transaction in the coroutine context: the transaction manager runs the block under `withContext(TransactionElement(dsl))`, and adapters read it with `currentCoroutineContext()`. An adapter that falls back to the root `DSLContext` when the element is missing, for example through a `db: DSLContext = this.db` default parameter, silently runs outside the transaction; make it fail instead.
 
 ---
 

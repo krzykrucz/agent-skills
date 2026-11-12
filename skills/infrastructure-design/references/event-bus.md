@@ -41,6 +41,31 @@ export class InMemoryEventBus implements EventBus {
 }
 ```
 
+```kotlin
+typealias EventHandler = suspend (DomainEvent) -> Either<DomainError, Unit>
+
+class InMemoryEventBus(subscribers: List<DomainEventSubscriber<*>>) : EventBus {
+    private val subscriptions: List<Pair<KClass<out DomainEvent>, EventHandler>> =
+        subscribers.flatMap { subscriber -> subscriber.subscribedTo().map { type -> type to subscriber.handler() } }
+
+    override suspend fun publish(events: List<DomainEvent>): Either<DomainError, Unit> = either {
+        events.forEach { event ->
+            // Sequential dispatch avoids sibling work outliving a rejected publication.
+            subscriptions
+                .filter { (type, _) -> type.isInstance(event) }
+                .forEach { (_, handle) -> handle(event).bind() }
+        }
+    }
+}
+
+// Safe: a handler is only invoked for events that are instances of its subscribed type
+@Suppress("UNCHECKED_CAST")
+private fun <T : DomainEvent> DomainEventSubscriber<T>.handler(): EventHandler =
+    { event -> on(event as T) }
+```
+
+In Kotlin, `bind()` implements fail-fast: the first `Left` stops later handlers and becomes the publication result. Match with `isInstance` rather than an exact-class map key, so a subscriber to a sealed parent such as `CourseDomainEvent` receives every subtype.
+
 Choose and document one failure policy:
 
 - **Fail-fast/propagate:** publication rejects if a synchronous handler fails.
@@ -61,6 +86,18 @@ await transactionManager.run(async (tx) => {
 });
 user.clearDomainEvents(pending); // only after commit succeeds
 ```
+
+```kotlin
+val (user, events) = result // pure domain function returned new state plus events with stable IDs; nothing to clear
+transactionManager.run { tx ->
+    either {
+        userRepository.save(user, tx).bind()
+        outbox.append(events.map(::toIntegrationMessage), tx).bind()
+    }
+}
+```
+
+In Kotlin, a `Left` from either write must roll back both; see `JooqTransactionManager` in `transactions.md`.
 
 An Event Bus that opens a separate transaction around only its inserts does not solve the dual-write problem. An external broker cannot participate atomically in a normal database transaction; retain the Outbox even when the relay publishes to RabbitMQ or Kafka.
 

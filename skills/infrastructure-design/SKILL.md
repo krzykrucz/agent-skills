@@ -4,7 +4,7 @@ description: Use when designing event buses or broker relays, Outbox/Inbox and C
 license: MIT
 metadata:
   author: luckys
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # Infrastructure Design
@@ -52,6 +52,7 @@ Practical infrastructure patterns for layered (hexagonal/DDD) applications. The 
 ## References
 
 - Read `references/retry-and-concurrency.md` when an operation can be retried, resumed, or executed by concurrent workers.
+- Code examples come in TypeScript and Kotlin pairs. Kotlin examples use coroutines, Arrow `Either`, jOOQ, and Spring Data Redis, and reuse the `DomainEvent`, `DomainError`, and subscriber contracts from `ddd-best-practices`.
 
 - `references/event-bus.md` — synchronous failure policy, transactional Outbox, relay claiming, fan-out, Inbox/idempotency, ordering, retries, dead-letter/replay, RabbitMQ and AWS EventBridge/SQS semantics, brokers, and CDC
 - `references/transactions.md` — transaction placement, Aggregate consistency boundaries, optimistic concurrency, decorator pattern, unit of work

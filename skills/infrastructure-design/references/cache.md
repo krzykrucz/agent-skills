@@ -50,6 +50,32 @@ async search(id: PostId): Promise<Post | null> {
 }
 ```
 
+```kotlin
+override suspend fun search(id: PostId): Either<InfrastructureError, Post?> {
+    val key = postKey(id)
+    return readCached(key)?.right()
+        ?: source.search(id).onRight { post -> post?.let { writeCached(key, it) } }
+}
+
+private suspend fun readCached(key: String): Post? =
+    Either.catch { redis.opsForValue().getAndAwait(key) }
+        .onLeft(metrics::cacheReadFailed)
+        .getOrNull()
+        ?.let(::decodePost)
+        ?.onLeft { error ->
+            metrics.cachePayloadInvalid(error)
+            Either.catch { redis.deleteAndAwait(key) }
+        }
+        ?.getOrNull()
+
+private suspend fun writeCached(key: String, post: Post) {
+    Either.catch { redis.opsForValue().setAndAwait(key, encodePost(post), ttlWithJitter(Duration.ofSeconds(60))) }
+        .onLeft(metrics::cacheWriteFailed)
+}
+```
+
+In Kotlin, Arrow's `Either.catch` rethrows `CancellationException`, so a cancelled request is not counted as a cache failure; a hand-written `catch (e: Exception)` must rethrow it explicitly. For the same reason, bound Redis calls with `withTimeoutOrNull` or the client's command timeout, not `withTimeout`: its `TimeoutCancellationException` escapes `Either.catch` and fails the read instead of falling back to the source. `decodePost` returns `Either<CachePayloadInvalid, Post>`, which keeps corruption distinct from a miss and from a Redis failure. A cache-aside wrapper can also decorate a single `suspend (Key) -> Either<E, V>` function instead of a whole repository; the policy rules below apply either way.
+
 For ordinary performance caches, reads should usually fail open to the authoritative source with short timeouts and a circuit breaker. Security decisions, authorization, idempotency, locks, and correctness-critical state are not ordinary caches; do not silently fail open there.
 
 Negative caching can protect the source from repeated misses, but use a distinguishable sentinel, short TTL, and invalidation on create. Never confuse cached absence, corrupted data, and Redis failure.
