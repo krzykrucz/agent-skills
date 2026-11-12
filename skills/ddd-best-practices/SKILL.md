@@ -77,7 +77,7 @@ Return complete Aggregates for invariant-bearing work; use dedicated query model
 
 ## Warning Signs
 
-- Anemic Domain Model: Entities have only getters/setters; all logic is in services.
+- Anemic Domain Model: state transitions live outside the domain model, so any caller can set any state. Immutable data with domain functions owning every transition is not anemic.
 - God Aggregate: one Aggregate contains everything related to a concept.
 - Shared database between Bounded Contexts — contexts are coupled through the schema.
 - Ubiquitous Language drift: code uses different terms from the domain experts.
