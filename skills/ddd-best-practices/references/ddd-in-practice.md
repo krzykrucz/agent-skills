@@ -778,6 +778,15 @@ class Order
 }
 ```
 
+**Functional equivalent:** the same protection without methods on the entity — the type makes shipping an unpaid order impossible:
+
+```kotlin
+data class PaidOrder(val id: OrderId)
+data class ShippedOrder(val id: OrderId, val shippedAt: Instant)
+
+fun ship(order: PaidOrder, now: Instant): ShippedOrder = ShippedOrder(order.id, now)
+```
+
 ### Using PHP `serialize/unserialize` for Domain Objects
 
 **Problem:** Refactoring class names or namespaces silently breaks deserialized objects stored in Redis or sessions.
