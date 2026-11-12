@@ -42,6 +42,8 @@ Practical infrastructure patterns for layered (hexagonal/DDD) applications. The 
 
 ## Related Skills
 
+These are optional companions from the same collection. If one isn't installed, the guidance here stands on its own; don't search for it.
+
 - `ddd-best-practices` — bounded context design and aggregate boundaries
 - `design-patterns-best-practices` — Decorator for transparent transaction/cache wrapping
 - `oop-best-practices` — domain interface design and dependency inversion

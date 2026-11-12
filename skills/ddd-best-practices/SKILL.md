@@ -114,6 +114,8 @@ Return complete Aggregates for invariant-bearing work; use dedicated query model
 
 ## Related Skills
 
+These are optional companions from the same collection. If one isn't installed, the guidance here stands on its own; don't search for it.
+
 - Use `oop-best-practices` for detailed Value Object construction, equality, immutability, optionality, persistence, and everyday object design within a Bounded Context.
 - Use `design-patterns-best-practices` for GoF and enterprise patterns inside the domain.
 - Use `refactoring-best-practices` when evolving an existing domain model safely.
