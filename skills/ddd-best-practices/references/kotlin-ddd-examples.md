@@ -2,6 +2,8 @@
 
 Kotlin ports of the TypeScript DDD building blocks in `typescript-ddd-examples.md`, based on the CodelyTV `typescript-ddd-example` repository. These show the full stack of building blocks working together in a real bounded context. `Promise` maps to `suspend`; Jest maps to JUnit 5, MockK, and AssertJ.
 
+Aggregates here are immutable and failures are values (Arrow `Either`); see `fp-best-practices` for the functional style these examples follow.
+
 Source: https://github.com/CodelyTV/typescript-ddd-example
 
 ---
@@ -10,7 +12,7 @@ Source: https://github.com/CodelyTV/typescript-ddd-example
 
 **Intent:** Organize code by Bounded Context, not by technical layer.
 
-**How it works:** A `contexts` package holds one package per bounded context (e.g., `mooc`, `backoffice`). Each context contains sub-domains organized by aggregate. A `shared` context holds cross-cutting building blocks (base classes, event bus, criteria). Inside each aggregate package, the split is always `domain` → `application` → `infrastructure`.
+**How it works:** A `contexts` package holds one package per bounded context (e.g., `mooc`, `backoffice`). Each context contains sub-domains organized by aggregate. A `shared` context holds cross-cutting building blocks (error marker, buses, criteria). Inside each aggregate package, the split is always `domain` → `application` → `infrastructure`.
 
 **Example:**
 ```
@@ -20,10 +22,12 @@ src/
       courses/
         domain/
           Course.kt                    # Aggregate Root
+          CourseResult.kt              # State + Events
+          CourseError.kt               # Typed failures
           CourseRepository.kt          # Port (interface)
           CourseName.kt                # Value Object
           CourseDuration.kt            # Value Object
-          CourseCreatedDomainEvent.kt  # Domain Event
+          CourseDomainEvent.kt         # Domain Events (sealed)
         application/
           create/
             CourseCreator.kt           # Use Case (Application Service)
@@ -31,17 +35,11 @@ src/
             CreateCourseCommandHandler.kt
         infrastructure/
           persistence/
-            mongo/
-              MongoCourseRepository.kt # Driven Adapter
+            postgres/
+              PostgresCourseRepository.kt # Driven Adapter
     shared/
       domain/
-        AggregateRoot.kt
-        DomainEvent.kt
-        EventBus.kt
-      infrastructure/
-        persistence/
-          mongo/
-            MongoRepository.kt
+        DomainError.kt
   test/kotlin/com/example/contexts/
     mooc/
       courses/
@@ -57,18 +55,29 @@ src/
 
 **Intent:** Give domain values explicit construction, immutable representation, and semantic equality.
 
-**How it works:** A `value class` or `data class` with a private constructor and a validating factory. Both generate structural `equals`/`hashCode`, so no shared base class is needed. Override equality only when the generated one is wrong for the domain: `Array` properties compare by reference, and `BigDecimal` equality includes scale.
+**How it works:** A `value class` or `data class` with a private constructor and a validating factory that returns `Either` — invalid input is a typed error value, not an exception. Both generate structural `equals`/`hashCode`, so no shared base class is needed. Override equality only when the generated one is wrong for the domain: `Array` properties compare by reference, and `BigDecimal` equality includes scale.
 
 **Example:**
 ```kotlin
+// contexts/shared/domain/DomainError.kt
+interface DomainError
+
+// contexts/mooc/courses/domain/CourseError.kt
+sealed interface CourseError : DomainError {
+    data class InvalidCourseName(val value: String) : CourseError
+    data class InvalidCourseId(val value: String) : CourseError
+    data object InvalidCriteria : CourseError
+    data class InfrastructureError(val reason: String, val cause: Throwable? = null) : CourseError
+}
+
 // contexts/mooc/courses/domain/CourseName.kt
 @JvmInline
 value class CourseName private constructor(val value: String) {
     companion object {
-        fun create(raw: String): CourseName {
+        fun create(raw: String): Either<CourseError.InvalidCourseName, CourseName> = either {
             val value = raw.trim()
-            if (value.isEmpty() || value.length > 30) throw CourseNameLengthExceeded(value)
-            return CourseName(value)
+            ensure(value.isNotEmpty() && value.length <= 30) { CourseError.InvalidCourseName(value) }
+            CourseName(value)
         }
     }
 }
@@ -77,9 +86,9 @@ value class CourseName private constructor(val value: String) {
 @JvmInline
 value class CourseId private constructor(val value: String) {
     companion object {
-        fun create(value: String): CourseId {
-            if (!isValidUuid(value)) throw InvalidCourseId(value)
-            return CourseId(value)
+        fun create(value: String): Either<CourseError.InvalidCourseId, CourseId> = either {
+            ensure(isValidUuid(value)) { CourseError.InvalidCourseId(value) }
+            CourseId(value)
         }
     }
 }
@@ -89,141 +98,82 @@ value class CourseId private constructor(val value: String) {
 
 ---
 
-## AggregateRoot Base Class
+## Aggregate Result (State + Events)
 
-**Intent:** Give every aggregate root the ability to collect domain events before publishing them, and enforce serialization to primitives.
+**Intent:** Return the aggregate's new state and the domain events it produced together, as one immutable value — no mutable event list hidden inside the aggregate.
 
-**How it works:** `AggregateRoot` maintains a private list of domain events. The aggregate records an event via `record()` when state changes. A best-effort in-process application service can drain these events after persistence. Durable cross-process delivery requires handing them to an Outbox in the same transaction as Aggregate state; do not clear the only event copy before durable handoff.
+**How it works:** Every aggregate operation returns a `CourseResult`: the resulting `Course` plus the events that explain the change. `plus` chains steps — the later state wins and events accumulate in order. Nothing is drained or cleared, so the only copy of an event cannot be lost before durable handoff.
 
 **Example:**
 ```kotlin
-// contexts/shared/domain/AggregateRoot.kt
-abstract class AggregateRoot {
-    private val domainEvents = mutableListOf<DomainEvent>()
-
-    fun pullDomainEvents(): List<DomainEvent> {
-        val events = domainEvents.toList()
-        domainEvents.clear()
-        return events
-    }
-
-    fun record(event: DomainEvent) {
-        domainEvents += event
-    }
-
-    abstract fun toPrimitives(): Map<String, Any?>
+// contexts/mooc/courses/domain/CourseResult.kt
+data class CourseResult(val course: Course, val events: List<CourseDomainEvent>) {
+    operator fun plus(other: CourseResult): CourseResult =
+        CourseResult(other.course, events + other.events)
 }
 ```
 
-**Practical heuristic:** Never publish from inside the Aggregate. The application/Unit of Work owns durable handoff. Treat direct `save -> pull -> publish` as educational in-process delivery only; use `infrastructure-design` for transactional Outbox delivery.
+**Practical heuristic:** The application persists the whole `CourseResult` atomically — state and Outbox rows in one transaction. The Aggregate never publishes; use `infrastructure-design` for transactional Outbox delivery.
 
 ---
 
 ## Aggregate Root (Concrete)
 
-**Intent:** Implement a rich aggregate root that uses the static factory method pattern to enforce valid creation and record domain events.
+**Intent:** Implement an immutable aggregate whose factory enforces valid creation and returns the resulting state together with its domain event.
 
-**How it works:** The `Course` aggregate extends `AggregateRoot`. Construction through the constructor is valid but does not produce events — used for reconstitution from persistence via `fromPrimitives()`. Creation through the `Course.create()` factory method records the `CourseCreatedDomainEvent`. All fields are typed as Value Objects, never raw primitives.
+**How it works:** `Course` is a `data class` of Value Objects, never raw primitives. `Course.create()` is a pure function: event id and time are passed in (from an injected clock and UUID generator), and it returns a `CourseResult` holding the new `Course` and `CourseCreated`. `version` is `null` until the first persist; the adapter uses it for optimistic locking. Reconstitution is the adapter building the data class directly from stored values — no events.
 
 **Example:**
 ```kotlin
 // contexts/mooc/courses/domain/Course.kt
-class Course(
+data class Course(
     val id: CourseId,
     val name: CourseName,
     val duration: CourseDuration,
-) : AggregateRoot() {
-
-    override fun toPrimitives(): Map<String, Any?> = mapOf(
-        "id" to id.value,
-        "name" to name.value,
-        "duration" to duration.value,
-    )
-
+    val version: Long?,
+) {
     companion object {
-        // Factory: creates a new Course and records the creation event
-        fun create(id: CourseId, name: CourseName, duration: CourseDuration): Course {
-            val course = Course(id, name, duration)
-            course.record(
-                CourseCreatedDomainEvent(
-                    aggregateId = course.id.value,
-                    duration = course.duration.value,
-                    name = course.name.value,
-                ),
-            )
-            return course
-        }
-
-        // Reconstitution: used by the repository adapter — no events recorded
-        fun fromPrimitives(plainData: Map<String, Any?>): Course =
-            Course(
-                CourseId.create(plainData["id"] as String),
-                CourseName.create(plainData["name"] as String),
-                CourseDuration(plainData["duration"] as String),
+        // Creation: a new Course plus the event that records it
+        fun create(
+            id: CourseId,
+            name: CourseName,
+            duration: CourseDuration,
+            eventId: UUID,
+            now: Instant,
+        ): CourseResult =
+            CourseResult(
+                course = Course(id, name, duration, version = null),
+                events = listOf(CourseDomainEvent.CourseCreated(eventId, now, id, name, duration)),
             )
     }
 }
 ```
 
-**Practical heuristic:** Keep creation and reconstitution semantically separate so loading cannot emit creation events. `create()` plus `fromPrimitives()` is one valid strategy; a dedicated mapper is another.
+**Practical heuristic:** Keep creation and reconstitution semantically separate so loading cannot emit creation events. Only domain functions that change state return events; the adapter's reconstitution returns a bare `Course`.
 
 ---
 
-## DomainEvent Base Class
+## Domain Events (Sealed)
 
-**Intent:** Give every domain event a consistent structure — event name, aggregate ID, event ID, and timestamp — while letting each concrete event define its own typed attributes.
+**Intent:** Give every domain event a consistent structure — event ID, timestamp, aggregate ID — while letting each concrete event define its own typed attributes.
 
-**How it works:** The abstract `DomainEvent` stores metadata automatically (generating `eventId` as a UUID and `occurredOn` as now if not provided). Kotlin has no abstract static members, so each concrete event declares `EVENT_NAME` and a `fromPrimitives()` factory (used by message bus infrastructure for deserialization) in its companion object, and implements `toPrimitives()` for serialization. `Instant` is immutable and always valid, so no defensive copy or date validation is needed.
+**How it works:** A `sealed interface` per aggregate lists every event it can produce, so adapters handle them with an exhaustive `when`. Each event is a `data class` of Value Objects. Metadata is passed in, never generated inside the domain: the use case supplies `eventId` and `occurredOn` from an injected UUID generator and `Clock`, which keeps creation deterministic and testable. Serialization belongs to the adapter.
 
 **Example:**
 ```kotlin
-// contexts/shared/domain/DomainEvent.kt
-abstract class DomainEvent(
-    val eventName: String,
-    val aggregateId: String,
-    eventId: String?,
-    occurredOn: Instant?,
-) {
-    val eventId: String = eventId ?: UUID.randomUUID().toString()
-    val occurredOn: Instant = occurredOn ?: Instant.now()
-
-    abstract fun toPrimitives(): Map<String, Any?>
-}
-
-// contexts/mooc/courses/domain/CourseCreatedDomainEvent.kt
-class CourseCreatedDomainEvent(
-    aggregateId: String,
-    val name: String,
-    val duration: String,
-    eventId: String? = null,
-    occurredOn: Instant? = null,
-) : DomainEvent(EVENT_NAME, aggregateId, eventId, occurredOn) {
-
-    override fun toPrimitives(): Map<String, Any?> =
-        mapOf("name" to name, "duration" to duration)
-
-    companion object {
-        const val EVENT_NAME = "course.created"
-
-        // Used by the event bus infrastructure to deserialize incoming messages
-        fun fromPrimitives(
-            aggregateId: String,
-            attributes: Map<String, Any?>,
-            eventId: String,
-            occurredOn: Instant,
-        ): CourseCreatedDomainEvent =
-            CourseCreatedDomainEvent(
-                aggregateId = aggregateId,
-                duration = attributes["duration"] as String,
-                name = attributes["name"] as String,
-                eventId = eventId,
-                occurredOn = occurredOn,
-            )
-    }
+// contexts/mooc/courses/domain/CourseDomainEvent.kt
+sealed interface CourseDomainEvent {
+    data class CourseCreated(
+        val eventId: UUID,
+        val occurredOn: Instant,
+        val courseId: CourseId,
+        val name: CourseName,
+        val duration: CourseDuration,
+    ) : CourseDomainEvent
 }
 ```
 
-**Practical heuristic:** Name domain events in the past tense with dot notation: `course.created`, `payment.confirmed`. The `EVENT_NAME` constant is the contract between producers and consumers — treat it as an immutable API once deployed.
+**Practical heuristic:** Name domain events in the past tense. The event name the adapter writes (`course.created`) and its wire format are the stable contract between producers and consumers — treat them as an immutable API once deployed, even when the Kotlin class is renamed.
 
 ---
 
@@ -231,14 +181,14 @@ class CourseCreatedDomainEvent(
 
 **Intent:** Declare what the domain needs from persistence in domain language, with no reference to any database technology.
 
-**How it works:** The repository interface lives in the `domain` package — it is part of the domain layer, not infrastructure. Method names use domain vocabulary. Return types are domain objects or aggregates, never raw database rows. The interface is the driven port; concrete adapters (Mongo, Postgres, in-memory) implement it in `infrastructure`.
+**How it works:** The repository interface lives in the `domain` package — it is part of the domain layer, not infrastructure. Method names use domain vocabulary. Return types are `Either` of domain objects or aggregates, never raw database rows; infrastructure failures are values too. A single `persist(result)` takes the whole `CourseResult` so state and events are written together. The interface is the driven port; concrete adapters (Postgres, in-memory) implement it in `infrastructure`.
 
 **Example:**
 ```kotlin
 // contexts/mooc/courses/domain/CourseRepository.kt
 interface CourseRepository {
-    suspend fun save(course: Course)
-    suspend fun searchAll(): List<Course>
+    suspend fun persist(result: CourseResult): Either<CourseError.InfrastructureError, Unit>
+    suspend fun searchAll(): Either<CourseError.InfrastructureError, List<Course>>
 }
 ```
 
@@ -246,47 +196,35 @@ interface CourseRepository {
 
 ---
 
-## EventBus Port (Interface)
+## Event Delivery (Outbox)
 
-**Intent:** Declare the outbound event publishing contract so the domain layer never depends on RabbitMQ, Kafka, or any specific broker.
+**Intent:** Deliver domain events to other processes reliably, without the domain or the use case depending on RabbitMQ, Kafka, or any specific broker.
 
-**Example:**
-```kotlin
-// contexts/shared/domain/EventBus.kt
-interface EventBus {
-    suspend fun publish(events: List<DomainEvent>)
-    fun addSubscribers(subscribers: DomainEventSubscribers)
-}
+**How it works:** `persist(result)` writes the aggregate state and one Outbox row per event in the same database transaction, so either both are stored or neither is. A separate relay reads the Outbox and publishes to the broker, retrying until acknowledged. Delivery is therefore at-least-once: consumers deduplicate by event ID and are idempotent.
 
-// contexts/shared/domain/DomainEventSubscriber.kt
-interface DomainEventSubscriber<T : DomainEvent> {
-    fun subscribedTo(): List<KClass<out DomainEvent>>
-    suspend fun on(domainEvent: T)
-}
-```
-
-**Practical heuristic:** For best-effort in-process reactions, inject an in-memory bus or a mock. For production broker delivery, persist an Outbox atomically and let a relay publish to the broker; do not publish directly from this use case.
+**Practical heuristic:** Neither the Aggregate nor the use case publishes. If an event must survive a crash, it goes through the Outbox; use `infrastructure-design` for relay, ordering, retry, and cleanup details.
 
 ---
 
 ## Use Case (Application Service)
 
-**Intent:** Orchestrate the domain — fetch, mutate via the aggregate, persist, publish events — with no business logic of its own.
+**Intent:** Orchestrate the domain — load, decide via the aggregate, persist the result — with no business logic of its own.
 
-**How it works:** `CourseCreator` receives dependencies through constructor injection. The Command Handler translates the flat DTO command into typed Value Objects. The direct publication below is suitable only for best-effort in-process reactions; replace it with a Unit of Work plus Outbox when events must survive failures.
+**How it works:** `CourseCreator` receives dependencies through constructor injection, including a `Clock` and a UUID generator so the domain stays pure. Inside `either {}`, each step short-circuits on the first error. The Command Handler translates the flat DTO command into typed Value Objects; invalid input returns a `Left` instead of throwing.
 
 **Example:**
 ```kotlin
 // contexts/mooc/courses/application/create/CourseCreator.kt
 class CourseCreator(
     private val repository: CourseRepository,
-    private val eventBus: EventBus,
+    private val clock: Clock,
+    private val generateUUID: () -> UUID,
 ) {
-    suspend fun run(id: CourseId, name: CourseName, duration: CourseDuration) {
-        val course = Course.create(id, name, duration)
-        repository.save(course)
-        eventBus.publish(course.pullDomainEvents())
-    }
+    suspend fun run(id: CourseId, name: CourseName, duration: CourseDuration): Either<CourseError, Unit> =
+        either {
+            val result = Course.create(id, name, duration, generateUUID(), clock.instant())
+            repository.persist(result).bind()
+        }
 }
 
 // contexts/mooc/courses/application/create/CreateCourseCommandHandler.kt
@@ -296,11 +234,11 @@ class CreateCourseCommandHandler(
 
     override fun subscribedTo(): KClass<CreateCourseCommand> = CreateCourseCommand::class
 
-    override suspend fun handle(command: CreateCourseCommand) {
-        val id = CourseId.create(command.id)
-        val name = CourseName.create(command.name)
+    override suspend fun handle(command: CreateCourseCommand): Either<DomainError, Unit> = either {
+        val id = CourseId.create(command.id).bind()
+        val name = CourseName.create(command.name).bind()
         val duration = CourseDuration(command.duration)
-        courseCreator.run(id, name, duration)
+        courseCreator.run(id, name, duration).bind()
     }
 }
 ```
@@ -309,52 +247,79 @@ class CreateCourseCommandHandler(
 
 ---
 
-## Infrastructure: MongoRepository Base (Driven Adapter)
+## Infrastructure: Postgres Repository (Driven Adapter)
 
-**Intent:** Provide a reusable base class for all MongoDB-backed repository adapters, keeping the toPrimitives/fromPrimitives mapping in each concrete class.
+**Intent:** Implement the repository port with Postgres and jOOQ, writing state and events atomically and mapping stored rows back to typed domain objects.
 
-**How it works:** `MongoRepository<T>` is generic over any `AggregateRoot` and uses the MongoDB Kotlin coroutine driver. It provides `persist()` (upsert by ID using `toPrimitives()`). Concrete repository classes extend this base and implement `collectionName()`. The `fromPrimitives()` call translates raw Mongo documents back into domain aggregates.
+**How it works:** `persist` runs in one transaction: it inserts a new course (`version == null`) or updates an existing one only if the stored version still matches, then inserts one Outbox row per event. An update that matches 0 rows means someone else changed the course first — returned as an error, never silently overwritten. An exhaustive `when` over the sealed events owns the event name and payload. Exceptions are caught at this boundary and become `InfrastructureError`. Reconstitution goes through the Value Object factories, so corrupt stored data surfaces as an error instead of a crash.
 
 **Example:**
 ```kotlin
-import com.mongodb.client.model.Filters.eq
-import com.mongodb.client.model.UpdateOptions
-import com.mongodb.kotlin.client.coroutine.MongoCollection
-import com.mongodb.kotlin.client.coroutine.MongoDatabase
+import org.jooq.kotlin.coroutines.transactionCoroutine
 import kotlinx.coroutines.flow.toList
-import org.bson.Document
+import kotlinx.coroutines.reactive.asFlow
+import kotlinx.coroutines.reactive.awaitSingle
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 
-// contexts/shared/infrastructure/persistence/mongo/MongoRepository.kt
-abstract class MongoRepository<T : AggregateRoot>(private val database: MongoDatabase) {
+// contexts/mooc/courses/infrastructure/persistence/postgres/PostgresCourseRepository.kt
+class PostgresCourseRepository(private val dsl: DSLContext) : CourseRepository {
 
-    protected abstract fun collectionName(): String
-
-    protected fun collection(): MongoCollection<Document> =
-        database.getCollection<Document>(collectionName())
-
-    protected suspend fun persist(id: String, aggregateRoot: T) {
-        val document = Document(aggregateRoot.toPrimitives() - "id")
-        collection().updateOne(eq("_id", id), Document("\$set", document), UpdateOptions().upsert(true))
+    override suspend fun persist(result: CourseResult): Either<CourseError.InfrastructureError, Unit> = either {
+        val written = Either.catch {
+            dsl.transactionCoroutine { config ->
+                val tx = config.dsl()
+                val course = result.course
+                val rows = when (val version = course.version) {
+                    null -> tx.insertInto(COURSE)
+                        .set(COURSE.ID, course.id.value)
+                        .set(COURSE.NAME, course.name.value)
+                        .set(COURSE.DURATION, course.duration.value)
+                        .set(COURSE.VERSION, 0L)
+                        .awaitSingle()
+                    else -> tx.update(COURSE)
+                        .set(COURSE.NAME, course.name.value)
+                        .set(COURSE.DURATION, course.duration.value)
+                        .set(COURSE.VERSION, version + 1)
+                        .where(COURSE.ID.eq(course.id.value))
+                        .and(COURSE.VERSION.eq(version))
+                        .awaitSingle()
+                }
+                if (rows == 0) return@transactionCoroutine false
+                result.events.forEach { event ->
+                    when (event) {
+                        is CourseDomainEvent.CourseCreated -> tx.insertInto(OUTBOX)
+                            .set(OUTBOX.ID, event.eventId)
+                            .set(OUTBOX.EVENT_NAME, "course.created")
+                            .set(OUTBOX.AGGREGATE_ID, event.courseId.value)
+                            .set(OUTBOX.OCCURRED_ON, event.occurredOn)
+                            .set(
+                                OUTBOX.PAYLOAD,
+                                Json.encodeToString(mapOf("name" to event.name.value, "duration" to event.duration.value)),
+                            )
+                            .awaitSingle()
+                    }
+                }
+                true
+            }
+        }.mapLeft { CourseError.InfrastructureError(it.message ?: "", it) }.bind()
+        ensure(written) { CourseError.InfrastructureError("stale version") }
     }
-}
 
-// Concrete adapter (in infrastructure/persistence/mongo/)
-class MongoCourseRepository(database: MongoDatabase) :
-    MongoRepository<Course>(database), CourseRepository {
-
-    override fun collectionName(): String = "courses"
-
-    override suspend fun save(course: Course) {
-        persist(course.id.value, course)
+    override suspend fun searchAll(): Either<CourseError.InfrastructureError, List<Course>> = either {
+        val records = Either.catch { dsl.selectFrom(COURSE).asFlow().toList() }
+            .mapLeft { CourseError.InfrastructureError(it.message ?: "", it) }
+            .bind()
+        records.map { r ->
+            either {
+                Course(CourseId.create(r.id).bind(), CourseName.create(r.name).bind(), CourseDuration(r.duration), r.version)
+            }.mapLeft { CourseError.InfrastructureError("corrupt course ${r.id}: $it") }.bind()
+        }
     }
-
-    override suspend fun searchAll(): List<Course> =
-        collection().find().toList()
-            .map { document -> Course.fromPrimitives(document + ("id" to document["_id"])) }
 }
 ```
 
-**Practical heuristic:** The concrete adapter is the only place where `toPrimitives()` and `fromPrimitives()` are called. Everything else in the system works with typed domain objects.
+**Practical heuristic:** The adapter is the only place that knows table columns, event names, and wire formats. Everything else in the system works with typed domain objects and `Either`.
 
 ---
 
@@ -387,13 +352,13 @@ data class CreateCourseCommand(
 
 **Intent:** Decouple the controller (driver adapter) from the use case by routing through a bus. The controller does not need to know which handler exists — it only dispatches a command or queries with a query.
 
-**How it works:** `CommandBus` dispatches a command and returns completion. `QueryBus` infers the response type carried by `Query<R>`. Both are interfaces implemented in infrastructure.
+**How it works:** `CommandBus` dispatches a command and returns completion or a domain error. `QueryBus` infers the response type carried by `Query<R>`. Both are interfaces implemented in infrastructure.
 
 **Example:**
 ```kotlin
 // contexts/shared/domain/CommandBus.kt
 interface CommandBus {
-    suspend fun dispatch(command: Command)
+    suspend fun dispatch(command: Command): Either<DomainError, Unit>
 }
 
 // contexts/shared/domain/QueryBus.kt
@@ -404,7 +369,7 @@ interface QueryBus {
 // contexts/shared/domain/CommandHandler.kt
 interface CommandHandler<T : Command> {
     fun subscribedTo(): KClass<T>
-    suspend fun handle(command: T)
+    suspend fun handle(command: T): Either<DomainError, Unit>
 }
 
 // contexts/shared/domain/QueryHandler.kt
@@ -414,7 +379,7 @@ interface QueryHandler<R, Q : Query<R>> {
 }
 ```
 
-**Practical heuristic:** CQRS split is at the bus level: commands mutate state and return nothing; queries read state and return a response. Never mix the two in one handler.
+**Practical heuristic:** CQRS split is at the bus level: commands mutate state and return only success or a domain error; queries read state and return a response. Never mix the two in one handler.
 
 ---
 
@@ -440,9 +405,8 @@ class CommandHandlers(commandHandlers: List<CommandHandler<*>>) {
 
 // contexts/shared/infrastructure/commandbus/InMemoryCommandBus.kt
 class InMemoryCommandBus(private val commandHandlers: CommandHandlers) : CommandBus {
-    override suspend fun dispatch(command: Command) {
+    override suspend fun dispatch(command: Command): Either<DomainError, Unit> =
         commandHandlers.get(command).handle(command)
-    }
 }
 ```
 
@@ -458,11 +422,11 @@ class InMemoryCommandBus(private val commandHandlers: CommandHandlers) : Command
 ```kotlin
 // Kotlin's built-in T? is the single absence representation — no utility type needed
 interface CourseRepository {
-    suspend fun findById(id: CourseId): Course?
+    suspend fun findById(id: CourseId): Either<CourseError.InfrastructureError, Course?>
 }
 ```
 
-**Practical heuristic:** Use `T?` in domain APIs rather than `java.util.Optional`, Arrow `Option`, or sentinel values. Accept other representations (Java platform types, `Optional`) only at an external boundary and normalize to `T?` immediately.
+**Practical heuristic:** Absence is `null` inside `Right`; `Left` is reserved for failures. Use `T?` in domain APIs rather than `java.util.Optional`, Arrow `Option`, or sentinel values. Accept other representations (Java platform types, `Optional`) only at an external boundary and normalize to `T?` immediately.
 
 ---
 
@@ -496,18 +460,16 @@ data class Criteria(
     val page: Page,
 )
 
-class InvalidCriteria : Exception()
-
-fun courseCriteria(input: Criteria): Criteria {
-    if (input.page.limit !in 1..100) throw InvalidCriteria()
-    if (input.page.offset < 0) throw InvalidCriteria()
-    if (input.order.lastOrNull()?.field != Order.Field.ID) throw InvalidCriteria()
+fun courseCriteria(input: Criteria): Either<CourseError.InvalidCriteria, Criteria> = either {
+    ensure(input.page.limit in 1..100) { CourseError.InvalidCriteria }
+    ensure(input.page.offset >= 0) { CourseError.InvalidCriteria }
+    ensure(input.order.lastOrNull()?.field == Order.Field.ID) { CourseError.InvalidCriteria }
     // vals are already immutable; copy the list in case the caller passed a MutableList
-    return input.copy(order = input.order.toList())
+    input.copy(order = input.order.toList())
 }
 
 interface CourseRepository {
-    suspend fun matching(criteria: Criteria): List<Course>
+    suspend fun matching(criteria: Criteria): Either<CourseError.InfrastructureError, List<Course>>
 }
 ```
 
@@ -526,7 +488,7 @@ interface CourseRepository {
 // src/test/kotlin/.../contexts/mooc/courses/domain/CourseMother.kt
 object CourseMother {
     fun create(id: CourseId, name: CourseName, duration: CourseDuration): Course =
-        Course(id, name, duration)
+        Course(id, name, duration, version = null)
 
     fun from(command: CreateCourseCommand): Course =
         create(
@@ -545,7 +507,8 @@ object CourseMother {
 
 // src/test/kotlin/.../contexts/mooc/courses/domain/CourseNameMother.kt
 object CourseNameMother {
-    fun create(value: String): CourseName = CourseName.create(value)
+    fun create(value: String): CourseName =
+        CourseName.create(value).getOrElse { error("invalid fixture: $it") }
     fun random(seed: Long): CourseName = create(WordMother.random(seed = seed, maxLength = 20))
     fun invalidName(): String = "a".repeat(40)
 }
@@ -571,50 +534,49 @@ object CreateCourseCommandMother {
 }
 ```
 
-**Practical heuristic:** Command Mothers produce flat primitives; Domain Mothers produce Value Objects. Keep them at the right layer — don't mix them.
+**Practical heuristic:** Command Mothers produce flat primitives; Domain Mothers produce Value Objects and unwrap factory `Either`s, failing loudly on an invalid fixture. Keep them at the right layer — don't mix them.
 
 ---
 
-## Unit Test Structure — Command Handler + Mock Repository + Mock EventBus
+## Unit Test Structure — Command Handler + Mock Repository
 
-**Intent:** Show the idiomatic test structure: inject mock repository and EventBus, use Object Mothers to build inputs and expectations, verify side effects on the mocks.
+**Intent:** Show the idiomatic test structure: inject a mock repository, a fixed clock, and a fixed UUID; use Object Mothers to build inputs and expectations; assert on the returned `Either` and on what was persisted.
 
-**How it works:** JUnit 5 creates a new test class instance per test, so mocks declared as properties are fresh for every test. `Course` and the event have identity equality, so captured arguments are compared field by field with AssertJ; generated event metadata is ignored.
+**How it works:** JUnit 5 creates a new test class instance per test, so mocks declared as properties are fresh for every test. `Course`, `CourseResult`, and events are data classes, so the expected persisted result compares by value; the fixed clock and UUID make event metadata deterministic. Invalid input returns a `Left` and nothing is persisted.
 
 **Example:**
 ```kotlin
 // src/test/kotlin/.../contexts/mooc/courses/application/CreateCourseCommandHandlerTest.kt
 class CreateCourseCommandHandlerTest {
 
-    private val repository = mockk<CourseRepository>(relaxUnitFun = true)
-    private val eventBus = mockk<EventBus>(relaxUnitFun = true)
-    private val creator = CourseCreator(repository, eventBus)
+    private val now = Instant.parse("2026-01-01T00:00:00Z")
+    private val eventId = UUID.fromString("00000000-0000-0000-0000-000000000001")
+    private val repository = mockk<CourseRepository> {
+        coEvery { persist(any()) } returns Unit.right()
+    }
+    private val creator = CourseCreator(repository, Clock.fixed(now, ZoneOffset.UTC)) { eventId }
     private val handler = CreateCourseCommandHandler(creator)
 
     @Test
     fun `should create a valid course`() = runTest {
         val command = CreateCourseCommandMother.random(42)
         val course = CourseMother.from(command)
-        val domainEvent = CourseCreatedDomainEventMother.fromCourse(course)
 
-        handler.handle(command)
+        assertThat(handler.handle(command)).isEqualTo(Unit.right())
 
-        val saved = slot<Course>()
-        val published = slot<List<DomainEvent>>()
-        coVerify { repository.save(capture(saved)) }
-        coVerify { eventBus.publish(capture(published)) }
-        assertThat(saved.captured).usingRecursiveComparison().isEqualTo(course)
-        assertThat(published.captured.last())
-            .usingRecursiveComparison()
-            .ignoringFields("eventId", "occurredOn")
-            .isEqualTo(domainEvent)
+        coVerify {
+            repository.persist(
+                CourseResult(course, listOf(CourseCreated(eventId, now, course.id, course.name, course.duration))),
+            )
+        }
     }
 
     @Test
-    fun `should throw error if course name length is exceeded`() = runTest {
-        val command = CreateCourseCommandMother.invalid(42)
+    fun `should return an error if course name length is exceeded`() = runTest {
+        assertThat(handler.handle(CreateCourseCommandMother.invalid(42)))
+            .isEqualTo(InvalidCourseName("a".repeat(40)).left())
 
-        assertThrows<CourseNameLengthExceeded> { handler.handle(command) }
+        coVerify(exactly = 0) { repository.persist(any()) }
     }
 }
 ```
