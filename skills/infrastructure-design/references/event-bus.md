@@ -44,15 +44,6 @@ export class InMemoryEventBus implements EventBus {
 **Kotlin:**
 
 ```kotlin
-interface DomainEventType {
-    val eventName: String
-}
-
-interface DomainEventSubscriber<E : DomainEvent> {
-    fun subscribedTo(): List<DomainEventType>
-    suspend fun on(event: E): Either<InfrastructureError, Unit>
-}
-
 typealias EventHandler = suspend (DomainEvent) -> Either<InfrastructureError, Unit>
 
 class InMemoryEventBus(subscribers: List<DomainEventSubscriber<DomainEvent>>) : EventBus {
